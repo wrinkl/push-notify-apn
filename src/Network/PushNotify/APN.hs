@@ -126,13 +126,13 @@ hexEncodedToken = ApnToken . B16.encode . fst . B16.decode . TE.encodeUtf8
 
 -- | The result of a send request
 data ApnMessageResult = ApnMessageResultOk
-                      | ApnMessageResultFatalError
-                      | ApnMessageResultTemporaryError
+                      | ApnMessageResultFatalError Int
+                      | ApnMessageResultTemporaryError (Maybe Int)
                       | ApnMessageResultTokenNoLongerValid
-    deriving (Enum, Eq, Show)
+    deriving (Eq, Show)
 
 instance SpecifyError ApnMessageResult where
-    isAnError = ApnMessageResultTemporaryError
+    isAnError = ApnMessageResultTemporaryError Nothing
 
 -- | The specification of a push notification's message body
 data JsonApsAlert = JsonApsAlert
@@ -529,22 +529,22 @@ sendApnRaw connection token message = bracket_
                 hdrs <- _waitHeaders stream
                 let (frameHeader, streamId, errOrHeaders) = hdrs
                 case errOrHeaders of
-                    Left err -> return ApnMessageResultTemporaryError
+                    Left err -> return $ ApnMessageResultTemporaryError Nothing
                     Right hdrs1 -> do
                         let Just status = DL.lookup ":status" hdrs1
                         return $ case status of
                             "200" -> ApnMessageResultOk
-                            "400" -> ApnMessageResultFatalError
-                            "403" -> ApnMessageResultFatalError
-                            "405" -> ApnMessageResultFatalError
+                            "400" -> ApnMessageResultFatalError 400
+                            "403" -> ApnMessageResultFatalError 403
+                            "405" -> ApnMessageResultFatalError 405
                             "410" -> ApnMessageResultTokenNoLongerValid
-                            "413" -> ApnMessageResultFatalError
-                            "429" -> ApnMessageResultTemporaryError
-                            "500" -> ApnMessageResultTemporaryError
-                            "503" -> ApnMessageResultTemporaryError           
+                            "413" -> ApnMessageResultFatalError 413
+                            "429" -> ApnMessageResultTemporaryError (Just 429)
+                            "500" -> ApnMessageResultTemporaryError (Just 500)
+                            "503" -> ApnMessageResultTemporaryError (Just 503)
         in StreamDefinition init handler
     case res of
-        Left _     -> return ApnMessageResultTemporaryError -- Too much concurrency
+        Left _     -> return $ ApnMessageResultTemporaryError Nothing -- Too much concurrency
         Right res1 -> return res1
 
 catchIOErrors :: SpecifyError a => IO a -> IO a
