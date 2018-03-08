@@ -37,6 +37,7 @@ module Network.PushNotify.APN
     , JsonApsAlert
     , JsonApsMessage
     , ApnMessageResult(..)
+    , ApnErrorReason(..)
     , ApnToken
     ) where
 
@@ -66,6 +67,7 @@ import Network.TLS.Extra.Cipher
 import System.IO.Error
 import System.Mem.Weak
 import System.Random
+import Text.Read (readMaybe)
 
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Base16 as B16
@@ -125,15 +127,97 @@ hexEncodedToken
     -- ^ The resulting token
 hexEncodedToken = ApnToken . B16.encode . fst . B16.decode . TE.encodeUtf8
 
+data ApnErrorReason
+    = BadCollapseId
+    -- ^ The collapse identifier exceeds the maximum allowed size
+    | BadDeviceToken
+    -- ^ The specified device token was bad. Verify that the request contains a
+    -- valid token and that the token matches the environment.
+    | BadExpirationDate
+    -- ^ The apns-expiration value is bad.
+    | BadMessageId
+    -- ^ The apns-id value is bad.
+    | BadPriority
+    -- ^ -- ^ The apns-priority value is bad.
+    | BadTopic
+    -- ^ The apns-topic was invalid.
+    | DeviceTokenNotForTopic
+    -- ^ The device token does not match the specified topic.
+    | DuplicateHeaders
+    -- ^ One or more headers were repeated.
+    | IdleTimeout
+    -- ^ Idle time out.
+    | MissingDeviceToken
+    -- ^ The device token is not specified in the request :path. Verify that the
+    -- :path header contains the device token.
+    | MissingTopic
+    -- ^ The apns-topic header of the request was not specified and was required.
+    -- The apns-topic header is mandatory when the client is connected using a
+    -- certificate that supports multiple topics.
+    | PayloadEmpty
+    -- ^ The message payload was empty.
+    | TopicDisallowed
+    -- ^ Pushing to this topic is not allowed.
+    | BadCertificate
+    -- ^ The certificate was bad.
+    | BadCertificateEnvironment
+    -- ^ The client certificate was for the wrong environment.
+    | ExpiredProviderToken
+    -- ^ The provider token is stale and a new token should be generated.
+    | Forbidden
+    -- ^ The specified action is not allowed.
+    | InvalidProviderToken
+    -- ^ The provider token is not valid or the token signature could not be
+    -- verified.
+    | MissingProviderToken
+    -- ^ No provider certificate was used to connect to APNs and Authorization
+    -- header was missing or no provider token was specified.
+    | BadPath
+    -- ^ The request contained a bad :path value.
+    | MethodNotAllowed
+    -- ^ The specified :method was not POST.
+    | Unregistered
+    -- ^ The device token is inactive for the specified topic.  Expected HTTP/2
+    -- status code is 410; see Table 8-4.
+    | PayloadTooLarge
+    -- ^ The message payload was too large. See Creating the Remote Notification
+    -- Payload for details on maximum payload size.
+    | TooManyProviderTokenUpdates
+    -- ^ The provider token is being updated too often.
+    | TooManyRequests
+    -- ^ Too many requests were made consecutively to the same device token.
+    | InternalServerError
+    -- ^ An internal server error occurred.
+    | ServiceUnavailable
+    -- ^ The service is unavailable.
+    | Shutdown
+    -- ^ The server is shutting down.
+    deriving (Eq, Show, Read)
+
+
 -- | The result of a send request
-data ApnMessageResult = ApnMessageResultOk
-                      | ApnMessageResultFatalError Int (Maybe Text)
-                      | ApnMessageResultTemporaryError (Maybe Int) (Maybe Text)
-                      | ApnMessageResultTokenNoLongerValid (Maybe Text)
+data ApnMessageResult
+    = ApnMessageResultOk                               -- ^ Apn message sent successfully
+    | ApnMessageResultError Int (Maybe ApnErrorReason) -- ^ Apn returned an error code/reason
+    | ApnMessageResultInternalError                    -- ^ Indicates something wrong on our end
     deriving (Eq, Show)
 
 instance SpecifyError ApnMessageResult where
-    isAnError = ApnMessageResultTemporaryError Nothing Nothing
+    isAnError = ApnMessageResultInternalError
+
+instance FromJSON ApnErrorReason where
+  parseJSON (Object v) = do
+    reasonText <- v .: "reason"
+    case readMaybe $ T.unpack reasonText of
+      Just reason -> return reason
+      Nothing     -> fail "Unexpected APN reason message"
+  parseJSON inv = typeMismatch "ApnErrorReason" inv
+
+-- | Usable by the end user to determine if they should try again
+apnErrorIsTemporary :: ApnMessageResult -> Bool
+apnErrorIsTemporary ApnMessageResultInternalError         = True
+apnErrorIsTemporary (ApnMessageResultError n _) | n > 413 = True
+apnErrorIsTemporary _                                     = False
 
 -- | The specification of a push notification's message body
 data JsonApsAlert = JsonApsAlert
@@ -530,19 +614,14 @@ sendApnRaw connection token message = bracket_
                 hdrs <- _waitHeaders stream
                 let (frameHeader, streamId, errOrHeaders) = hdrs
                 case errOrHeaders of
-                    Left err -> return isAnError
-                    Right hdrs1 ->
-                      let Just status = (read . T.unpack . TE.decodeUtf8) <$> DL.lookup ":status" hdrs1
-                          resOrData =
-                              if | status == 200                  -> Right ApnMessageResultOk
-                                 | status == 410                  -> Left $ ApnMessageResultTokenNoLongerValid
-                                 | 400 <= status && status <= 413 -> Left $ ApnMessageResultFatalError status
-                                 | otherwise                      -> Left $ ApnMessageResultTemporaryError (Just status)
-                      in case resOrData of
-                             Right r -> return r
-                             Left f -> do
-                               (_, errOrReason) <- _waitData stream
-                               return $ f $ either (const Nothing) (Just . TE.decodeUtf8) errOrReason
+                    Left err -> return ApnMessageResultInternalError
+                    Right hdrs1 -> do
+                      case DL.lookup ":status" hdrs1 >>= readByteString of
+                          Nothing   -> return ApnMessageResultInternalError
+                          Just 200  -> return ApnMessageResultOk
+                          Just code -> do
+                            (_, errOrReason) <- _waitData stream
+                            return $ ApnMessageResultError code (rightToMaybe errOrReason >>= decodeStrict)
         in StreamDefinition init handler
     case res of
         Left _     -> return isAnError -- Too much concurrency
@@ -550,3 +629,9 @@ sendApnRaw connection token message = bracket_
 
 catchIOErrors :: SpecifyError a => IO a -> IO a
 catchIOErrors = flip catchIOError (const $ return isAnError)
+
+rightToMaybe :: Either a b -> Maybe b
+rightToMaybe = either (const Nothing) Just
+
+readByteString :: Read a => ByteString -> Maybe a
+readByteString = readMaybe . T.unpack . TE.decodeUtf8
